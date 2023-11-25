@@ -384,6 +384,12 @@ func (s *remoteSealer) makeWork(block *types.Block) {
 	if header.BaseFee != nil {
 		enc = append(enc, header.BaseFee)
 	}
+	if header.MinerReward != nil {
+		enc = append(enc, header.MinerReward)
+	}
+	if header.FundReward != nil {
+		enc = append(enc, header.FundReward)
+	}
 	encoded, err := rlp.EncodeToBytes(enc)
 	if err == nil {
 		s.currentWork[9] = hexutil.Encode(encoded)
