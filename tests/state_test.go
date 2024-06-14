@@ -228,7 +228,7 @@ func runBenchmark(b *testing.B, t *StateTest) {
 
 			// Create "contract" for sender to cache code analysis.
 			sender := vm.NewContract(vm.AccountRef(msg.From), vm.AccountRef(msg.From),
-				nil, 0)
+				nil, 0, nil)
 
 			var (
 				gasUsed uint64

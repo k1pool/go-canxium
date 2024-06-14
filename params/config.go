@@ -447,11 +447,14 @@ type ChainConfig struct {
 	Clique *CliqueConfig `json:"clique,omitempty"`
 
 	// Canxium foundation wallet, should change to multi sig wallet in the future fork
-	Foundation common.Address `json:"foundation,omitempty"`
+	Foundation     common.Address `json:"foundation,omitempty"`
+	MiningContract common.Address `json:"miningContract,omitempty"`
 }
 
 // EthashConfig is the consensus engine configs for proof-of-work based sealing.
-type EthashConfig struct{}
+type EthashConfig struct {
+	MinimumDifficulty *big.Int `json:"minimumDifficulty,omitempty"`
+}
 
 // String implements the stringer interface, returning the consensus engine details.
 func (c *EthashConfig) String() string {
@@ -499,6 +502,15 @@ func (c *ChainConfig) Description() string {
 	default:
 		banner += "Consensus: unknown\n"
 	}
+
+	if c.Foundation != (common.Address{}) {
+		banner += fmt.Sprintf("Foundation:      #%-8v \n", c.Foundation)
+	}
+
+	if c.MiningContract != (common.Address{}) {
+		banner += fmt.Sprintf("Mining Contract: #%-8v \n", c.MiningContract)
+	}
+
 	banner += "\n"
 
 	// Create a list of forks with a short description of them. Forks that only
@@ -536,7 +548,33 @@ func (c *ChainConfig) Description() string {
 		banner += fmt.Sprintf(" - Hydro Fork:                  #%-8v \n", c.HydroBlock)
 	}
 
+	// Add a special section for the merge as it's non-obvious
+	if c.TerminalTotalDifficulty == nil {
+		banner += "The Merge is not yet available for this network!\n"
+		banner += " - Hard-fork specification: https://github.com/ethereum/execution-specs/blob/master/network-upgrades/mainnet-upgrades/paris.md\n"
+	} else {
+		banner += "Merge configured:\n"
+		banner += " - Hard-fork specification:    https://github.com/ethereum/execution-specs/blob/master/network-upgrades/mainnet-upgrades/paris.md\n"
+		banner += fmt.Sprintf(" - Network known to be merged: %v\n", c.TerminalTotalDifficultyPassed)
+		banner += fmt.Sprintf(" - Total terminal difficulty:  %v\n", c.TerminalTotalDifficulty)
+		if c.MergeNetsplitBlock != nil {
+			banner += fmt.Sprintf(" - Merge netsplit block:       #%-8v\n", c.MergeNetsplitBlock)
+		}
+	}
+
 	banner += "\n"
+
+	// Create a list of forks post-merge
+	banner += "Post-Merge hard forks (timestamp based):\n"
+	if c.ShanghaiTime != nil {
+		banner += fmt.Sprintf(" - Shanghai:                    @%-10v (https://github.com/ethereum/execution-specs/blob/master/network-upgrades/mainnet-upgrades/shanghai.md)\n", *c.ShanghaiTime)
+	}
+	if c.CancunTime != nil {
+		banner += fmt.Sprintf(" - Cancun:                      @%-10v\n", *c.CancunTime)
+	}
+	if c.PragueTime != nil {
+		banner += fmt.Sprintf(" - Prague:                      @%-10v\n", *c.PragueTime)
+	}
 
 	return banner
 }
@@ -947,7 +985,7 @@ type Rules struct {
 	IsHomestead, IsEIP150, IsEIP155, IsEIP158               bool
 	IsByzantium, IsConstantinople, IsPetersburg, IsIstanbul bool
 	IsBerlin, IsLondon                                      bool
-	IsMerge, IsShanghai, IsCancun, IsPrague                 bool
+	IsMerge, IsShanghai, IsCancun, IsPrague, IsHydro        bool
 }
 
 // Rules ensures c's ChainID is not nil.
@@ -972,5 +1010,6 @@ func (c *ChainConfig) Rules(num *big.Int, isMerge bool, timestamp uint64) Rules 
 		IsShanghai:       c.IsShanghai(timestamp),
 		IsCancun:         c.IsCancun(timestamp),
 		IsPrague:         c.IsPrague(timestamp),
+		IsHydro:          c.IsHydro(num),
 	}
 }

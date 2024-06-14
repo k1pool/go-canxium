@@ -60,10 +60,12 @@ type Contract struct {
 
 	Gas   uint64
 	value *big.Int
+
+	IsMiningContract bool
 }
 
 // NewContract returns a new contract environment for the execution of EVM.
-func NewContract(caller ContractRef, object ContractRef, value *big.Int, gas uint64) *Contract {
+func NewContract(caller ContractRef, object ContractRef, value *big.Int, gas uint64, miningContract *common.Address) *Contract {
 	c := &Contract{CallerAddress: caller.Address(), caller: caller, self: object}
 
 	if parent, ok := caller.(*Contract); ok {
@@ -78,6 +80,11 @@ func NewContract(caller ContractRef, object ContractRef, value *big.Int, gas uin
 	c.Gas = gas
 	// ensures a value is set
 	c.value = value
+	if miningContract != nil {
+		c.IsMiningContract = object.Address() == *miningContract
+	} else {
+		c.IsMiningContract = false
+	}
 
 	return c
 }
@@ -160,11 +167,24 @@ func (c *Contract) Caller() common.Address {
 
 // UseGas attempts the use gas and subtracts it and returns true on success
 func (c *Contract) UseGas(gas uint64) (ok bool) {
+	// Interact with mining contract will always free of gas limit
+	if c.IsMiningContract {
+		return true
+	}
 	if c.Gas < gas {
 		return false
 	}
 	c.Gas -= gas
 	return true
+}
+
+// UseGas attempts the add gas to this contract
+func (c *Contract) AddGas(gas uint64) {
+	// Interact with mining contract will always free of gas limit, no subtracts nor add
+	if c.IsMiningContract {
+		return
+	}
+	c.Gas += gas
 }
 
 // Address returns the contracts address
