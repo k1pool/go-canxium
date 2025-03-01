@@ -268,6 +268,7 @@ type TxPool struct {
 	eip1559  atomic.Bool // Fork indicator whether we are using EIP-1559 type transactions.
 	shanghai atomic.Bool // Fork indicator whether we are in the Shanghai stage.
 	hydro    atomic.Bool // Fork indicator whether we are in the Hydro stage.
+	helium   atomic.Bool // Fork indicator whether we are in the Helium stage.
 
 	currentState  *state.StateDB // Current state in the blockchain head
 	pendingNonces *noncer        // Pending state tracking virtual nonces
@@ -442,21 +443,41 @@ func (pool *TxPool) loop() {
 			// Mining reward will decrease every month for 24 consecutive months.
 			for _, list := range pool.queue {
 				txs := list.Flatten()
-				for _, tx := range txs {
-					if tx.IsMiningTx() && !pool.isValidMiningSubsidy(head.Number, tx) {
-						pool.removeTx(tx.Hash(), true)
-					}
-				}
+				pool.removeOldMiningTxs(head, txs)
 			}
 			for _, list := range pool.pending {
 				txs := list.Flatten()
-				for _, tx := range txs {
-					if tx.IsMiningTx() && !pool.isValidMiningSubsidy(head.Number, tx) {
-						pool.removeTx(tx.Hash(), true)
-					}
-				}
+				pool.removeOldMiningTxs(head, txs)
 			}
+
 			pool.mu.Unlock()
+		}
+	}
+}
+
+func (pool *TxPool) removeOldMiningTxs(currentHeader *types.Header, txs types.Transactions) {
+	for _, tx := range txs {
+		if !tx.IsMiningTx() {
+			continue
+		}
+		// Clear old cross mining transactions
+		if tx.Type() == types.CrossMiningTxType {
+			proof := tx.AuxPoW()
+			miner, err := proof.GetMinerAddress()
+			if err != nil {
+				pool.removeTx(tx.Hash(), true)
+				continue
+			}
+			stTimestamp := pool.currentState.GetCrossMiningTimestamp(pool.chainconfig.MiningContract, miner, proof.Chain())
+			if proof.Timestamp() <= stTimestamp {
+				log.Trace("Removing old cross mining transaction because of invalid block's timestamp", "tx timestamp", proof.Timestamp(), "database timestamp", stTimestamp)
+				pool.removeTx(tx.Hash(), true)
+				continue
+			}
+		}
+		// Clear old mining tx which is not valid subsidy for this current block time
+		if !pool.isValidMiningSubsidy(currentHeader.Number, currentHeader.Time, tx) {
+			pool.removeTx(tx.Hash(), true)
 		}
 	}
 }
@@ -650,6 +671,11 @@ func (pool *TxPool) validateTxBasics(tx *types.Transaction, local bool) error {
 	if !pool.hydro.Load() && tx.Type() == types.MiningTxType {
 		return core.ErrTxTypeNotSupported
 	}
+	// fork for the cross mining tx
+	if !pool.helium.Load() && tx.Type() == types.CrossMiningTxType {
+		return core.ErrTxTypeNotSupported
+	}
+
 	// Reject transactions over defined size to prevent DOS attacks
 	if tx.Size() > txMaxSize {
 		return ErrOversizedData
@@ -678,11 +704,6 @@ func (pool *TxPool) validateTxBasics(tx *types.Transaction, local bool) error {
 	if tx.GasFeeCapIntCmp(tx.GasTipCap()) < 0 {
 		return core.ErrTipAboveFeeCap
 	}
-	// Make sure the transaction is signed properly.
-	sender, err := types.Sender(pool.signer, tx)
-	if err != nil {
-		return ErrInvalidSender
-	}
 	// Drop non-local transactions under our own minimal accepted gas price or tip
 	// Always accept mining tx as gas free, because miner will earn % of reward
 	if !local && tx.GasTipCapIntCmp(pool.gasPrice) < 0 && !tx.IsMiningTx() {
@@ -697,20 +718,13 @@ func (pool *TxPool) validateTxBasics(tx *types.Transaction, local bool) error {
 		return core.ErrIntrinsicGas
 	}
 
-	if tx.Type() == types.MiningTxType {
-		// Ensure destination have to be the mining contract
-		if tx.To() == nil || *tx.To() != pool.chainconfig.MiningContract {
-			return ErrInvalidMiningReceiver
-		}
-		// check consensus rule: tx sender have to match with tx from to prevent replaying
-		if sender != tx.From() {
-			return ErrInvalidMiningSender
-		}
+	if tx.IsMiningTx() {
 		// check tx seal, minimum difficulty
-		pendingBlock := new(big.Int).Add(pool.chain.CurrentBlock().Number, big.NewInt(1))
-		if err := pool.engine.VerifyTxSeal(pool.chainconfig, tx, pendingBlock, false); err != nil {
+		if err := pool.engine.VerifyMiningTxSeal(pool.chainconfig, tx, pool.chain.CurrentBlock(), false); err != nil {
 			return err
 		}
+	} else if misc.IsUnauthorizedCrossMiningTx(pool.chainconfig, tx) {
+		return misc.ErrUnauthorizedCrossMiningTx
 	}
 
 	return nil
@@ -725,12 +739,29 @@ func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
 	if pool.currentState.GetNonce(from) > tx.Nonce() {
 		return core.ErrNonceTooLow
 	}
+	// Ensure the cross mining transaction adheres to block timestamp ordering
+	if tx.Type() == types.CrossMiningTxType {
+		if tx.AuxPoW() == nil {
+			return misc.ErrInvalidCrossChainBlock
+		}
+		proof := tx.AuxPoW()
+		miner, err := proof.GetMinerAddress()
+		if err != nil {
+			return err
+		}
+
+		stTimestamp := pool.currentState.GetCrossMiningTimestamp(pool.chainconfig.MiningContract, miner, proof.Chain())
+		log.Trace("[TxPool] Getting cross mining timestamp: ", "tx nonce", tx.Nonce(), "miner", miner, "tx timestamp", proof.Timestamp(), "state timestamp", stTimestamp)
+		if proof.Timestamp() <= stTimestamp {
+			return core.ErrCrossMiningTimestampTooLow
+		}
+	}
 	// Transactor should have enough funds to cover the costs
 	// cost == V + GP * GL + Contract Creation Fee
 	balance := pool.currentState.GetBalance(from)
 	cost := tx.Cost()
 	if tx.To() == nil { // contract creation
-		cost = new(big.Int).Add(cost, params.CanxiumContractCreationFee)
+		cost = new(big.Int).Add(cost, params.CanxiumContractCreationPostHeliumFee)
 	}
 
 	if balance.Cmp(cost) < 0 {
@@ -1136,6 +1167,11 @@ func (pool *TxPool) Get(hash common.Hash) *types.Transaction {
 	return pool.all.Get(hash)
 }
 
+// Get returns a transaction if it is contained in the pool and nil otherwise.
+func (pool *TxPool) GetByAuxPoWHash(hash string) *common.Hash {
+	return pool.all.GetMerge(hash)
+}
+
 // Has returns an indicator whether txpool has a transaction cached with the
 // given hash.
 func (pool *TxPool) Has(hash common.Hash) bool {
@@ -1464,6 +1500,7 @@ func (pool *TxPool) reset(oldHead, newHead *types.Header) {
 	pool.eip1559.Store(pool.chainconfig.IsLondon(next))
 	pool.shanghai.Store(pool.chainconfig.IsShanghai(uint64(time.Now().Unix())))
 	pool.hydro.Store(pool.chainconfig.IsHydro(next))
+	pool.helium.Store(pool.chainconfig.IsHelium(uint64(time.Now().Unix())))
 }
 
 // promoteExecutables moves transactions that have become processable from the
@@ -1723,10 +1760,21 @@ func (pool *TxPool) demoteUnexecutables() {
 }
 
 // Check if the mining transaction has correct value, mining rewards will be reduced every month
-func (pool *TxPool) isValidMiningSubsidy(headNumber *big.Int, tx *types.Transaction) bool {
-	subsidy := pool.engine.TransactionMiningSubsidy(pool.chainconfig, headNumber)
-	value := new(big.Int).Mul(subsidy, tx.Difficulty())
-	return tx.Value().Cmp(value) == 0
+func (pool *TxPool) isValidMiningSubsidy(headNumber *big.Int, headTime uint64, tx *types.Transaction) bool {
+	if tx.Type() == types.MiningTxType {
+		subsidy := misc.TransactionMiningSubsidy(pool.chainconfig, headNumber)
+		value := new(big.Int).Mul(subsidy, tx.Difficulty())
+		return tx.Value().Cmp(value) == 0
+	}
+
+	if tx.Type() == types.CrossMiningTxType {
+		forkTime := misc.CrossMiningForkTime(pool.chainconfig, tx.AuxPoW().Chain())
+		value := misc.CrossMiningReward(tx.AuxPoW(), forkTime, headTime)
+		return tx.Value().Cmp(value) == 0
+	}
+
+	// always return true for other tx types
+	return true
 }
 
 // addressByHeartbeat is an account address tagged with its last activity timestamp.
@@ -1828,6 +1876,8 @@ type lookup struct {
 	lock    sync.RWMutex
 	locals  map[common.Hash]*types.Transaction
 	remotes map[common.Hash]*types.Transaction
+	// Map of merge block's hash to transaction hash, to make sure no dupplicate merge block
+	merges map[string]*common.Hash
 }
 
 // newLookup returns a new lookup structure.
@@ -1835,6 +1885,7 @@ func newLookup() *lookup {
 	return &lookup{
 		locals:  make(map[common.Hash]*types.Transaction),
 		remotes: make(map[common.Hash]*types.Transaction),
+		merges:  make(map[string]*common.Hash),
 	}
 }
 
@@ -1888,6 +1939,14 @@ func (t *lookup) GetRemote(hash common.Hash) *types.Transaction {
 	return t.remotes[hash]
 }
 
+// GetMerge returns transaction hash if it exists in the lookup, or false if not found.
+func (t *lookup) GetMerge(hash string) *common.Hash {
+	t.lock.RLock()
+	defer t.lock.RUnlock()
+
+	return t.merges[hash]
+}
+
 // Count returns the current number of transactions in the lookup.
 func (t *lookup) Count() int {
 	t.lock.RLock()
@@ -1933,6 +1992,11 @@ func (t *lookup) Add(tx *types.Transaction, local bool) {
 	} else {
 		t.remotes[tx.Hash()] = tx
 	}
+
+	if tx.Type() == types.CrossMiningTxType {
+		txHash := tx.Hash()
+		t.merges[tx.AuxPoW().BlockHash()] = &txHash
+	}
 }
 
 // Remove removes a transaction from the lookup.
@@ -1953,6 +2017,9 @@ func (t *lookup) Remove(hash common.Hash) {
 
 	delete(t.locals, hash)
 	delete(t.remotes, hash)
+	if tx.Type() == types.CrossMiningTxType {
+		delete(t.merges, tx.AuxPoW().BlockHash())
+	}
 }
 
 // RemoteToLocals migrates the transactions belongs to the given locals to locals

@@ -51,6 +51,8 @@ type StateDB interface {
 	GetTransientState(addr common.Address, key common.Hash) common.Hash
 	SetTransientState(addr common.Address, key, value common.Hash)
 
+	GetCrossMiningTimestamp(common.Address, common.Address, types.CrossChain) uint64
+
 	Suicide(common.Address) bool
 	HasSuicided(common.Address) bool
 

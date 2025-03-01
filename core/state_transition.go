@@ -25,6 +25,7 @@ import (
 	cmath "github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -128,6 +129,15 @@ func toWordSize(size uint64) uint64 {
 
 // A Message contains the data derived from a single transaction that is relevant to state
 // processing.
+type MergeMiningMessage struct {
+	ToContract common.Address
+	FromMiner  common.Address
+	BlockTime  uint64
+	FromChain  types.CrossChain
+}
+
+// A Message contains the data derived from a single transaction that is relevant to state
+// processing.
 type Message struct {
 	To         *common.Address
 	From       common.Address
@@ -145,8 +155,10 @@ type Message struct {
 	// This field will be set to true for operations like RPC eth_call.
 	SkipAccountChecks bool
 
-	// is mining tx
+	// is mining tx or cross mining tx
 	IsMiningTx bool
+	// to present dupplicate cross mining block, compare the block's timestamp
+	CrossMining *MergeMiningMessage
 }
 
 // TransactionToMessage converts a transaction into a Message.
@@ -162,11 +174,24 @@ func TransactionToMessage(tx *types.Transaction, s types.Signer, baseFee *big.In
 		Data:              tx.Data(),
 		AccessList:        tx.AccessList(),
 		SkipAccountChecks: false,
-		IsMiningTx:        tx.Type() == types.MiningTxType,
+		IsMiningTx:        tx.IsMiningTx(),
 	}
 	// If baseFee provided, set gasPrice to effectiveGasPrice.
 	if baseFee != nil {
 		msg.GasPrice = cmath.BigMin(msg.GasPrice.Add(msg.GasTipCap, baseFee), msg.GasFeeCap)
+	}
+	if tx.Type() == types.CrossMiningTxType {
+		proof := tx.AuxPoW()
+		miner, err := proof.GetMinerAddress()
+		if err != nil {
+			return nil, err
+		}
+		msg.CrossMining = &MergeMiningMessage{
+			ToContract: *tx.To(),
+			FromMiner:  miner,
+			FromChain:  proof.Chain(),
+			BlockTime:  proof.Timestamp(),
+		}
 	}
 	var err error
 	msg.From, err = types.Sender(s, tx)
@@ -254,7 +279,9 @@ func (st *StateTransition) buyGas(contractCreation bool) error {
 	}
 	// this is the correct way to check the balance
 	if contractCreation {
-		if st.evm.ChainConfig().IsShanghai(st.evm.Context.Time) {
+		if st.evm.ChainConfig().IsHelium(st.evm.Context.Time) {
+			balanceCheck.Add(balanceCheck, params.CanxiumContractCreationPostHeliumFee)
+		} else if st.evm.ChainConfig().IsShanghai(st.evm.Context.Time) {
 			balanceCheck.Add(balanceCheck, params.CanxiumContractCreationFee)
 		} else {
 			// for backward compatible, pre-hydro fork check the contract creation independently
@@ -276,8 +303,12 @@ func (st *StateTransition) buyGas(contractCreation bool) error {
 }
 
 func (st *StateTransition) payContractCreationFee() error {
-	st.state.SubBalance(st.msg.From, params.CanxiumContractCreationFee)
-	st.state.AddBalance(st.evm.ChainConfig().Foundation, params.CanxiumContractCreationFee)
+	contractCreationFee := params.CanxiumContractCreationFee
+	if st.evm.ChainConfig().IsHelium(st.evm.Context.Time) {
+		contractCreationFee = params.CanxiumContractCreationPostHeliumFee
+	}
+	st.state.SubBalance(st.msg.From, contractCreationFee)
+	st.state.AddBalance(st.evm.ChainConfig().Foundation, contractCreationFee)
 	return nil
 }
 
@@ -302,6 +333,16 @@ func (st *StateTransition) preCheck(contractCreation bool) error {
 		if codeHash != (common.Hash{}) && codeHash != types.EmptyCodeHash {
 			return fmt.Errorf("%w: address %v, codehash: %s", ErrSenderNoEOA,
 				msg.From.Hex(), codeHash)
+		}
+
+		// Make sure cross mining tx block timestamp is in order
+		if msg.IsMiningTx && msg.CrossMining != nil {
+			stTimeStamp := st.state.GetCrossMiningTimestamp(msg.CrossMining.ToContract, msg.CrossMining.FromMiner, msg.CrossMining.FromChain)
+			log.Trace("[State] Getting cross mining timestamp: ", "tx nonce", msg.Nonce, "miner", msg.CrossMining.FromMiner, "tx timestamp", msg.CrossMining.BlockTime, "state timestamp", stTimeStamp)
+			if msg.CrossMining.BlockTime <= stTimeStamp {
+				return fmt.Errorf("%w: address %v, tx: %d state: %d", ErrCrossMiningTimestampTooLow,
+					msg.CrossMining.FromMiner.Hex(), msg.CrossMining.BlockTime, stTimeStamp)
+			}
 		}
 	}
 
@@ -388,7 +429,6 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 	if msg.IsMiningTx && msg.Value.Sign() > 0 {
 		st.state.AddBalance(msg.From, msg.Value)
 	}
-
 	// Check clause 6
 	if msg.Value.Sign() > 0 && !st.evm.Context.CanTransfer(st.state, msg.From, msg.Value) {
 		return nil, fmt.Errorf("%w: address %v", ErrInsufficientFundsForTransfer, msg.From.Hex())
